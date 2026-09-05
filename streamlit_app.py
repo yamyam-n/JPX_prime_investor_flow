@@ -97,8 +97,47 @@ def parse_period_text(text):
     return pd.NaT, pd.NaT
 
 
+def _looks_like_excel_link(a):
+    """JPX attachments do not always expose .xls/.xlsx in href. Judge by href/text/image alt."""
+    href = (a.get('href') or '').strip()
+    if not href or href.startswith('#') or href.lower().startswith('javascript:'):
+        return False
+    text = clean_text(a.get_text(' ', strip=True))
+    img_alt = clean_text(' '.join(img.get('alt', '') for img in a.find_all('img')))
+    title = clean_text(a.get('title', ''))
+    blob = ' '.join([href, text, img_alt, title]).lower()
+    if '.pdf' in blob or 'pdf' in text.lower() or 'pdf' in img_alt.lower():
+        return False
+    return (
+        '.xls' in blob or '.xlsx' in blob or
+        'excel' in blob or 'エクセル' in blob or
+        '/att/' in href.lower() or '-att/' in href.lower()
+    )
+
+
+def _best_excel_from_cell(cell, base_url):
+    """Return the Excel/attachment link from one JPX table cell."""
+    links = []
+    for a in cell.find_all('a', href=True):
+        if not _looks_like_excel_link(a):
+            continue
+        href = urljoin(base_url, a['href'])
+        blob = ' '.join([href, a.get_text(' ', strip=True), a.get('title','')]).lower()
+        score = 0
+        if '.xlsx' in blob: score += 30
+        elif '.xls' in blob: score += 25
+        if 'excel' in blob or 'エクセル' in blob: score += 20
+        if '/att/' in href.lower() or '-att/' in href.lower(): score += 8
+        if '.pdf' in blob: score -= 100
+        links.append((score, href))
+    if not links:
+        return None
+    links.sort(reverse=True)
+    return links[0][1]
+
+
 def extract_week_rows(html, base_url):
-    """日付のある表行だけを対象に、最後のExcelリンク=金額ファイルを取得。サンプルを混ぜない。"""
+    """Read the JPX weekly table. The 3rd logical column is Value(金額)."""
     soup = BeautifulSoup(html, 'html.parser')
     found = []
     for tr in soup.find_all('tr'):
@@ -109,26 +148,43 @@ def extract_week_rows(html, base_url):
         cells = tr.find_all(['td', 'th'])
         if len(cells) < 2:
             continue
-        # JPX表は「日付 | 株数 | 金額」。金額列（最後のセル）内のExcelを優先。
-        candidates = []
-        for a in cells[-1].find_all('a', href=True):
-            href = urljoin(base_url, a['href'])
-            if re.search(r'\.xlsx?(?:\?|$)', href, re.I):
-                candidates.append(href)
-        # レイアウト変更時等の保険として行内も確認
-        if not candidates:
-            for a in tr.find_all('a', href=True):
-                href = urljoin(base_url, a['href'])
-                if re.search(r'\.xlsx?(?:\?|$)', href, re.I) and ('val' in href.lower() or 'stock_1_w_' in href.lower()):
-                    candidates.append(href)
-        if not candidates:
+
+        # JPX current layout is Date | Volume | Value. Some cells contain PDF+Excel icons.
+        # Always inspect the right-most data cell first; do NOT infer from filename.
+        url = _best_excel_from_cell(cells[-1], base_url)
+
+        # If colspan/markup changes, inspect cells from right to left and choose the first Excel link.
+        if not url:
+            for cell in reversed(cells[1:]):
+                url = _best_excel_from_cell(cell, base_url)
+                if url:
+                    break
+
+        if not url:
             continue
-        # 旧形式は val を最優先。新形式は unified workbook。
-        val_links = [u for u in candidates if 'val' in u.lower()]
-        url = val_links[-1] if val_links else candidates[-1]
         found.append({'text': row_text, 'url': url, 'start': start, 'end': end})
     return found
 
+
+def extract_archive_urls(html, base_url):
+    """JPX archives can be links or <select><option value=...>. Collect both."""
+    soup = BeautifulSoup(html, 'html.parser')
+    urls = []
+    def add(raw):
+        if not raw:
+            return
+        u = urljoin(base_url, raw)
+        lo = u.lower()
+        if 'investor-type' in lo and u not in urls and not any(x in lo for x in ['.pdf','.xls','.xlsx']):
+            urls.append(u)
+    for a in soup.find_all('a', href=True):
+        href = a.get('href','')
+        txt = clean_text(a.get_text(' ', strip=True)).lower()
+        if 'archive' in href.lower() or 'バックナンバー' in txt or re.search(r'/investor-type/\d{4}', href):
+            add(href)
+    for opt in soup.find_all('option'):
+        add(opt.get('value'))
+    return urls
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def discover_week_files(max_weeks=26):
@@ -137,12 +193,7 @@ def discover_week_files(max_weeks=26):
     r.raise_for_status()
     records = extract_week_rows(r.text, JPX_WEEKLY)
 
-    soup = BeautifulSoup(r.text, 'html.parser')
-    archive_urls = []
-    for a in soup.find_all('a', href=True):
-        href = urljoin(JPX_WEEKLY, a['href'])
-        if 'investor-type' in href and 'archives' in href and href not in archive_urls:
-            archive_urls.append(href)
+    archive_urls = extract_archive_urls(r.text, JPX_WEEKLY)
 
     # 現行ページに十分な週数がなければアーカイブを順番に読む
     for archive_url in archive_urls:
@@ -167,10 +218,19 @@ def discover_week_files(max_weeks=26):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def read_excel_url(url):
-    r = requests.get(url, headers=HEADERS, timeout=30)
+    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
     r.raise_for_status()
-    bio = io.BytesIO(r.content)
-    engine = 'xlrd' if url.lower().split('?')[0].endswith('.xls') else 'openpyxl'
+    content = r.content
+    ctype = (r.headers.get('Content-Type') or '').lower()
+    # Excel OOXML is ZIP (PK); legacy XLS is OLE compound document (D0 CF 11 E0).
+    is_xlsx = content[:2] == b'PK' or 'spreadsheetml' in ctype or 'xlsx' in ctype
+    is_xls = content[:4] == bytes.fromhex('D0CF11E0') or 'ms-excel' in ctype
+    if not (is_xlsx or is_xls):
+        # JPX attachment URLs can omit extensions; give a useful diagnostic if HTML/PDF was picked.
+        head = content[:80].decode('latin1', errors='ignore').replace('\n',' ')
+        raise ValueError(f'Excelではない応答です (Content-Type={ctype or "unknown"}, head={head!r})')
+    bio = io.BytesIO(content)
+    engine = 'openpyxl' if is_xlsx else 'xlrd'
     return pd.read_excel(bio, sheet_name=None, header=None, engine=engine)
 
 
@@ -340,7 +400,7 @@ def parse_file(url):
 
 
 st.title('📊 JPX 投資部門別売買状況 — 東証プライム')
-st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.3')
+st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.4')
 
 with st.sidebar:
     st.header('表示設定')
@@ -354,7 +414,7 @@ except Exception as e:
     st.stop()
 
 if not files:
-    st.error('JPXの週次・金額Excelを見つけられませんでした。')
+    st.error('JPXの週次データ行は確認できましたが、金額欄のExcelリンクを取得できませんでした。v1.4では拡張子なしのJPX添付リンクにも対応しています。')
     st.stop()
 
 rows, errors = [], []
