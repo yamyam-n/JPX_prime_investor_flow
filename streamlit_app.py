@@ -98,110 +98,103 @@ def parse_period_text(text):
     return pd.NaT, pd.NaT
 
 
-def _extract_excel_links_from_row(tr, base_url):
-    """JPX週次テーブル1行からExcelリンクを直接抽出する。
-
-    旧形式ではJPXの添付URL名に `val` (金額) / `vol` (株数) が含まれる。
-    URL自体はランダムなディレクトリ配下なので、ファイル名を生成せずHTMLのhrefを使う。
-    """
+def _all_jpx_links_from_row(tr, base_url):
+    """行内のJPXリンクを拡張子で絞らず回収する。"""
     hits = []
     for a in tr.find_all('a', href=True):
-        href = a.get('href', '').strip()
-        if not href:
+        href = (a.get('href') or '').strip()
+        if not href or href.lower().startswith(('javascript:', '#')):
             continue
         u = urljoin(base_url, href)
+        if 'jpx.co.jp' in u.lower():
+            hits.append({'url': u, 'text': clean_text(a.get_text(' ', strip=True))})
+    return hits
+
+
+def _excel_candidates_from_links(links):
+    """JPX旧形式の金額Excel候補を作る。
+
+    2026/9/28までのJPX資料では、金額PDFは `stock_val_1_YYMMWW.pdf`、
+    Excelは同じディレクトリ・同じベース名の `.xls` で公開されている。
+    HTML側でExcel hrefが取得できない場合でも、金額PDFの実hrefからExcelを復元する。
+    """
+    direct = []
+    derived = []
+    amount_pdfs = []
+    generic_excels = []
+    for item in links:
+        u = item['url']
         lo = u.lower()
-        if 'jpx.co.jp' not in lo:
-            continue
-        if ('xls' in lo or 'xlsx' in lo) and ('equities' in lo or 'investor-type' in lo):
-            hits.append(u)
-    return list(dict.fromkeys(hits))
+        txt = item.get('text', '')
+        if re.search(r'\.xlsx?(?:$|\?)', lo):
+            if 'stock_val' in lo or '金額' in txt or 'value' in txt.lower():
+                direct.append(u)
+            else:
+                generic_excels.append(u)
+        if re.search(r'\.pdf(?:$|\?)', lo) and ('stock_val' in lo or '金額' in txt or 'value' in txt.lower()):
+            amount_pdfs.append(u)
+
+    # 実在する金額PDFのディレクトリをそのまま使い、拡張子だけExcelへ。
+    for pdf in amount_pdfs:
+        base = re.sub(r'\.pdf(?=($|\?))', '', pdf, flags=re.I)
+        # 旧形式の本命は .xls。念のため .xlsx も候補にする。
+        derived.extend([base + '.xls', base + '.xlsx'])
+
+    # 新形式は固定ファイル名 stock_1_w_YYYYMMDD_YYYYMMDD.xlsx
+    unified = [item['url'] for item in links if re.search(r'/stock_1_w_\d{8}_\d{8}\.xlsx(?:$|\?)', item['url'].lower())]
+    out = unified + direct + derived + generic_excels
+    return list(dict.fromkeys(out)), amount_pdfs
 
 
 def extract_week_rows(html, base_url):
-    """JPX週次表を「日付行 + 続くExcel行」のブロックとして読む。
-
-    JPX旧フォーマットのHTMLは、1週間が複数の<tr>に分かれることがある。
-    日付がある行だけを見ていると、次行に置かれたExcelリンクを取り逃す。
-    そこで次の日付行が来るまで同じ週としてリンクを蓄積する。
-    """
+    """週次表を日付ブロック化し、金額Excel候補を作る。"""
     soup = BeautifulSoup(html, 'html.parser')
-    found, diagnostics = [], []
-    blocks = []
-    current = None
-
-    # 投資部門別の週次表を優先。複数テーブルがあっても日付を持つ行だけでブロック化する。
+    blocks, current = [], None
     for tr in soup.find_all('tr'):
         row_text = tr.get_text(' ', strip=True)
         start, end = parse_period_text(row_text)
-        links = _extract_excel_links_from_row(tr, base_url)
-
+        links = _all_jpx_links_from_row(tr, base_url)
         if pd.notna(end):
             if current is not None:
                 blocks.append(current)
             current = {'text': row_text, 'start': start, 'end': end, 'links': list(links)}
         elif current is not None and links:
-            # 日付セルがrowspanで前行にあり、Excelリンクだけが次行にあるJPX旧形式への対応
             current['links'].extend(links)
-
     if current is not None:
         blocks.append(current)
 
+    found, diagnostics = [], []
     for b in blocks:
-        links = list(dict.fromkeys(b['links']))
-        amount = None
-
-        # 2026/9/29以降の新形式（株数・金額統合）
-        for u in links:
-            if re.search(r'/stock_1_w_\d{8}_\d{8}\.xlsx(?:$|\?)', u.lower()):
-                amount = u
-                break
-
-        # 旧形式：金額Excelのファイル名には stock_val / val が入る
-        if amount is None:
-            vals = [u for u in links if ('stock_val' in u.lower() or re.search(r'(^|[_/.-])val([_/.-]|$)', u.lower()))]
-            if vals:
-                # xls/xlsxを優先しPDFを除外
-                excel_vals = [u for u in vals if re.search(r'\.xlsx?(?:$|\?)', u.lower())]
-                amount = excel_vals[0] if excel_vals else vals[0]
-
-        # 文字列が難しい場合は、Excel拡張子のリンク群からValue側らしい順番で候補を残す
-        if amount is None:
-            excels = [u for u in links if re.search(r'\.xlsx?(?:$|\?)', u.lower())]
-            if len(excels) == 1:
-                amount = excels[0]
-            elif len(excels) >= 2:
-                # JPX旧表は通常「株数 → 金額」の順。最後のExcelを金額候補とする。
-                amount = excels[-1]
-
-        if amount:
-            found.append({'text': b['text'], 'url': amount, 'start': b['start'], 'end': b['end'], 'all_links': links})
+        # URL単位で重複排除
+        uniq = []
+        seen = set()
+        for x in b['links']:
+            if x['url'] not in seen:
+                seen.add(x['url']); uniq.append(x)
+        candidates, pdfs = _excel_candidates_from_links(uniq)
+        if candidates:
+            found.append({
+                'text': b['text'], 'start': b['start'], 'end': b['end'],
+                'candidates': candidates, 'amount_pdfs': pdfs,
+                'all_links': [x['url'] for x in uniq],
+            })
         else:
-            diagnostics.append({'text': b['text'], 'candidates': links})
-
+            diagnostics.append({'text': b['text'], 'candidates': [x['url'] for x in uniq]})
     return found, diagnostics
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def discover_week_files(max_weeks=26):
-    """JPX公式アーカイブを直接読む。
-
-    現行トップページは表示用HTMLで添付hrefが取りにくい場合があるため、
-    実ファイルhrefを持つ公式バックナンバー URL を優先する。
-    """
     pages = [JPX_WEEKLY_ARCHIVE_2026, JPX_WEEKLY]
-    records, diagnostics = [], []
-    page_errors = []
+    records, diagnostics, page_errors = [], [], []
     for page in pages:
         try:
             r = requests.get(page, headers=HEADERS, timeout=30)
             r.raise_for_status()
             more, diag = extract_week_rows(r.text, page)
-            records.extend(more)
-            diagnostics.extend(diag)
+            records.extend(more); diagnostics.extend(diag)
         except Exception as e:
             page_errors.append(f'{page}: {e}')
-
     by_end = {}
     for rec in records:
         key = rec['end']
@@ -209,26 +202,40 @@ def discover_week_files(max_weeks=26):
             by_end[key] = rec
     out = sorted(by_end.values(), key=lambda x: x['end'], reverse=True)
     if not out and page_errors:
-        diagnostics.append({'text':'ページ取得エラー','candidates':page_errors})
+        diagnostics.append({'text': 'ページ取得エラー', 'candidates': page_errors})
     return out[:max_weeks], diagnostics
 
 
+def _excel_kind(content, ctype=''):
+    ctype = (ctype or '').lower()
+    if content[:2] == b'PK' or 'spreadsheetml' in ctype or 'xlsx' in ctype:
+        return 'xlsx'
+    if content[:4] == bytes.fromhex('D0CF11E0') or 'ms-excel' in ctype:
+        return 'xls'
+    return None
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def read_excel_url(url):
-    r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
-    r.raise_for_status()
-    content = r.content
-    ctype = (r.headers.get('Content-Type') or '').lower()
-    # Excel OOXML is ZIP (PK); legacy XLS is OLE compound document (D0 CF 11 E0).
-    is_xlsx = content[:2] == b'PK' or 'spreadsheetml' in ctype or 'xlsx' in ctype
-    is_xls = content[:4] == bytes.fromhex('D0CF11E0') or 'ms-excel' in ctype
-    if not (is_xlsx or is_xls):
-        # JPX attachment URLs can omit extensions; give a useful diagnostic if HTML/PDF was picked.
-        head = content[:80].decode('latin1', errors='ignore').replace('\n',' ')
-        raise ValueError(f'Excelではない応答です (Content-Type={ctype or "unknown"}, head={head!r})')
-    bio = io.BytesIO(content)
-    engine = 'openpyxl' if is_xlsx else 'xlrd'
-    return pd.read_excel(bio, sheet_name=None, header=None, engine=engine)
+def read_excel_candidates(candidates):
+    """候補URLを順に実GETし、Excel本体であることをmagic bytes/content-typeで確認して開く。"""
+    errors = []
+    for url in candidates:
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30, allow_redirects=True)
+            r.raise_for_status()
+            kind = _excel_kind(r.content, r.headers.get('Content-Type'))
+            if not kind:
+                errors.append(f'{url} -> Excelではない ({r.headers.get("Content-Type")})')
+                continue
+            engine = 'openpyxl' if kind == 'xlsx' else 'xlrd'
+            sheets = pd.read_excel(io.BytesIO(r.content), sheet_name=None, header=None, engine=engine)
+            if not sheets:
+                errors.append(f'{url} -> Excelは開けたがシートなし')
+                continue
+            return url, kind, sheets
+        except Exception as e:
+            errors.append(f'{url} -> {e}')
+    raise ValueError('Excel候補を取得・読込できませんでした:\n' + '\n'.join(errors[:8]))
 
 
 def sheet_score_for_prime(name, df):
@@ -380,11 +387,11 @@ def validate_parsed(d):
     return True, ''
 
 
-def parse_file(url):
-    sheets = read_excel_url(url)
+def parse_file(candidates):
+    resolved_url, kind, sheets = read_excel_candidates(tuple(candidates))
     name, df = choose_prime_sheet(sheets)
     # unified fileはファイル名で判定、それ以外は旧形式
-    is_new = 'stock_1_w_' in url.lower()
+    is_new = 'stock_1_w_' in resolved_url.lower()
     parsed = parse_new_format(df) if is_new else parse_old_prime(df)
     ok, msg = validate_parsed(parsed)
     if not ok:
@@ -393,11 +400,11 @@ def parse_file(url):
     parsed = parsed.copy()
     for col in ['売り', '買い', '差引']:
         parsed[col] = parsed[col] * multiplier
-    return name, unit, parsed
+    return resolved_url, name, unit, parsed
 
 
 st.title('📊 JPX 投資部門別売買状況 — 東証プライム')
-st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.7')
+st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.8')
 
 with st.sidebar:
     st.header('表示設定')
@@ -411,7 +418,7 @@ except Exception as e:
     st.stop()
 
 if not files:
-    st.error('JPXの週次ブロックは確認できましたが、金額Excelを解決できませんでした。v1.7ではJPX公式バックナンバーの実hrefを直接読み、旧形式はURL中の val（金額）を選択します。')
+    st.error('JPXの週次ブロックは確認できましたが、金額Excelを解決できませんでした。v1.8では金額PDFの実hrefから同一ディレクトリのExcel URLも復元し、Excel本体を検証してから読み込みます。')
     if link_diagnostics:
         with st.expander('リンク診断', expanded=True):
             for d in link_diagnostics[:6]:
@@ -423,15 +430,15 @@ rows, errors = [], []
 progress = st.progress(0, text='JPXデータを取得中…')
 for i, rec in enumerate(files):
     try:
-        sheet, unit, d = parse_file(rec['url'])
+        resolved_url, sheet, unit, d = parse_file(rec['candidates'])
         for _, r in d.iterrows():
             rows.append({
                 '週開始': rec['start'], '週終了': rec['end'],
                 '投資部門': r['投資部門'], '売り': r['売り'], '買い': r['買い'], '差引': r['差引'],
-                'source': rec['url'], 'sheet': sheet, 'source_unit': unit,
+                'source': resolved_url, 'sheet': sheet, 'source_unit': unit,
             })
     except Exception as e:
-        errors.append((rec['text'], rec['url'], str(e)))
+        errors.append((rec['text'], '\n'.join(rec['candidates'][:4]), str(e)))
     progress.progress((i + 1) / max(1, len(files)), text=f'JPXデータを取得中… {i + 1}/{len(files)}')
 progress.empty()
 
