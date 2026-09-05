@@ -119,37 +119,66 @@ def _extract_excel_links_from_row(tr, base_url):
 
 
 def extract_week_rows(html, base_url):
-    """JPX週次アーカイブの各行から金額Excelを取得。
+    """JPX週次表を「日付行 + 続くExcel行」のブロックとして読む。
 
-    2026/9/28までの旧形式は href 中の `val` を金額ファイルとして採用。
-    2026/9/29以降の新形式は `stock_1_w_YYYYMMDD_YYYYMMDD.xlsx` を採用。
+    JPX旧フォーマットのHTMLは、1週間が複数の<tr>に分かれることがある。
+    日付がある行だけを見ていると、次行に置かれたExcelリンクを取り逃す。
+    そこで次の日付行が来るまで同じ週としてリンクを蓄積する。
     """
     soup = BeautifulSoup(html, 'html.parser')
     found, diagnostics = [], []
+    blocks = []
+    current = None
+
+    # 投資部門別の週次表を優先。複数テーブルがあっても日付を持つ行だけでブロック化する。
     for tr in soup.find_all('tr'):
         row_text = tr.get_text(' ', strip=True)
         start, end = parse_period_text(row_text)
-        if pd.isna(end):
-            continue
         links = _extract_excel_links_from_row(tr, base_url)
+
+        if pd.notna(end):
+            if current is not None:
+                blocks.append(current)
+            current = {'text': row_text, 'start': start, 'end': end, 'links': list(links)}
+        elif current is not None and links:
+            # 日付セルがrowspanで前行にあり、Excelリンクだけが次行にあるJPX旧形式への対応
+            current['links'].extend(links)
+
+    if current is not None:
+        blocks.append(current)
+
+    for b in blocks:
+        links = list(dict.fromkeys(b['links']))
         amount = None
-        # 新形式を最優先
+
+        # 2026/9/29以降の新形式（株数・金額統合）
         for u in links:
             if re.search(r'/stock_1_w_\d{8}_\d{8}\.xlsx(?:$|\?)', u.lower()):
                 amount = u
                 break
-        # 旧形式: JPXの金額ファイルはURL名に val が入る
+
+        # 旧形式：金額Excelのファイル名には stock_val / val が入る
         if amount is None:
-            vals = [u for u in links if 'val' in u.lower()]
+            vals = [u for u in links if ('stock_val' in u.lower() or re.search(r'(^|[_/.-])val([_/.-]|$)', u.lower()))]
             if vals:
-                amount = vals[0]
-        # 念のため、行内のExcelが1本しかない場合はそれを採用
-        if amount is None and len(links) == 1:
-            amount = links[0]
+                # xls/xlsxを優先しPDFを除外
+                excel_vals = [u for u in vals if re.search(r'\.xlsx?(?:$|\?)', u.lower())]
+                amount = excel_vals[0] if excel_vals else vals[0]
+
+        # 文字列が難しい場合は、Excel拡張子のリンク群からValue側らしい順番で候補を残す
+        if amount is None:
+            excels = [u for u in links if re.search(r'\.xlsx?(?:$|\?)', u.lower())]
+            if len(excels) == 1:
+                amount = excels[0]
+            elif len(excels) >= 2:
+                # JPX旧表は通常「株数 → 金額」の順。最後のExcelを金額候補とする。
+                amount = excels[-1]
+
         if amount:
-            found.append({'text': row_text, 'url': amount, 'start': start, 'end': end})
+            found.append({'text': b['text'], 'url': amount, 'start': b['start'], 'end': b['end'], 'all_links': links})
         else:
-            diagnostics.append({'text': row_text, 'candidates': links})
+            diagnostics.append({'text': b['text'], 'candidates': links})
+
     return found, diagnostics
 
 
@@ -368,7 +397,7 @@ def parse_file(url):
 
 
 st.title('📊 JPX 投資部門別売買状況 — 東証プライム')
-st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.6')
+st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.7')
 
 with st.sidebar:
     st.header('表示設定')
@@ -382,7 +411,7 @@ except Exception as e:
     st.stop()
 
 if not files:
-    st.error('JPXの週次行は確認できましたが、金額Excelを解決できませんでした。v1.6ではJPX公式バックナンバーの実hrefを直接読み、旧形式はURL中の val（金額）を選択します。')
+    st.error('JPXの週次ブロックは確認できましたが、金額Excelを解決できませんでした。v1.7ではJPX公式バックナンバーの実hrefを直接読み、旧形式はURL中の val（金額）を選択します。')
     if link_diagnostics:
         with st.expander('リンク診断', expanded=True):
             for d in link_diagnostics[:6]:
