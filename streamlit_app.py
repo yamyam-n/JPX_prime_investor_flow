@@ -261,6 +261,101 @@ for c,(name,val) in zip(cols,kpis):
     if pd.isna(val): c.metric(name,'—')
     else: c.metric(name,f'{val:+,.0f} 億円')
 
+
+# --- 投資家別 売買グラフ -------------------------------------------------
+st.divider()
+st.subheader('投資家別 売買推移')
+st.caption('売りはマイナス、買いはプラス、差引は折れ線で表示します。')
+
+available_investors = [x for x in ALIASES.keys() if x in all_df['投資部門'].astype(str).unique().tolist()]
+if not available_investors:
+    available_investors = sorted(all_df['投資部門'].astype(str).unique().tolist())
+
+g1, g2 = st.columns([2, 1])
+with g1:
+    investor_pick = st.selectbox(
+        '投資家を選択',
+        available_investors,
+        index=available_investors.index('海外投資家') if '海外投資家' in available_investors else 0,
+        key='investor_detail_pick',
+    )
+with g2:
+    period_pick = st.radio('集計単位', ['週次', '月次'], horizontal=True, key='period_detail_pick')
+
+one = all_df[all_df['投資部門'].astype(str).eq(investor_pick)].copy()
+one['売り表示'] = -one['売り'].abs()
+one['買い表示'] = one['買い'].abs()
+
+# JPXリンクのURLやラベルから週の終了日をできるだけ復元する
+url_to_order = {u:i for i,(_,u) in enumerate(reversed(links))}
+one['_order'] = one['source'].map(url_to_order).fillna(0)
+
+def extract_date(row):
+    u = str(row.get('source',''))
+    # URL内の YYYYMMDD_YYYYMMDD を優先し終了日を採用
+    m = re.search(r'(20\\d{2})(\\d{2})(\\d{2})[_-](20\\d{2})(\\d{2})(\\d{2})', u)
+    if m:
+        return pd.Timestamp(int(m.group(4)), int(m.group(5)), int(m.group(6)))
+    # 表示ラベルから MM/DD〜MM/DD。年はURL中の年を補完
+    label = str(row.get('週',''))
+    m2 = re.search(r'(\\d{1,2})/(\\d{1,2}).*?(\\d{1,2})/(\\d{1,2})', label)
+    ym = re.search(r'(20\\d{2})', u)
+    if m2 and ym:
+        y = int(ym.group(1))
+        return pd.Timestamp(y, int(m2.group(3)), int(m2.group(4)))
+    return pd.NaT
+
+one['_date'] = one.apply(extract_date, axis=1)
+one = one.sort_values(['_date','_order'], na_position='last')
+
+if period_pick == '月次':
+    valid = one.dropna(subset=['_date']).copy()
+    if not valid.empty:
+        valid['月'] = valid['_date'].dt.to_period('M').astype(str)
+        detail = valid.groupby('月', as_index=False)[['売り表示','買い表示','差引']].sum()
+        detail = detail.rename(columns={'月':'期間'})
+    else:
+        # 日付が取れない場合は4週単位の簡易集計
+        tmp = one.reset_index(drop=True).copy()
+        tmp['_mgrp'] = np.arange(len(tmp)) // 4
+        detail = tmp.groupby('_mgrp', as_index=False)[['売り表示','買い表示','差引']].sum()
+        detail['期間'] = detail['_mgrp'].map(lambda x: f'4週集計 {x+1}')
+else:
+    detail = one[['週','売り表示','買い表示','差引']].copy().rename(columns={'週':'期間'})
+
+# 添付イメージに近い、上下バー＋差引線
+fig_detail = go.Figure()
+fig_detail.add_trace(go.Bar(
+    x=detail['期間'], y=detail['売り表示'], name='Sales',
+    hovertemplate='%{x}<br>売り: %{customdata:,.0f} 億円<extra></extra>',
+    customdata=detail['売り表示'].abs(),
+))
+fig_detail.add_trace(go.Bar(
+    x=detail['期間'], y=detail['買い表示'], name='Purchases',
+    hovertemplate='%{x}<br>買い: %{y:,.0f} 億円<extra></extra>',
+))
+fig_detail.add_trace(go.Scatter(
+    x=detail['期間'], y=detail['差引'], name='Balance', mode='lines+markers',
+    yaxis='y2', hovertemplate='%{x}<br>差引: %{y:+,.0f} 億円<extra></extra>',
+))
+fig_detail.update_layout(
+    title=f'{investor_pick} — {period_pick}',
+    barmode='relative',
+    height=520,
+    margin=dict(l=10,r=10,t=55,b=10),
+    legend=dict(orientation='h', yanchor='bottom', y=-0.22, xanchor='center', x=0.5),
+    xaxis=dict(title=''),
+    yaxis=dict(title='売買金額（億円）', zeroline=True, zerolinewidth=1),
+    yaxis2=dict(title='差引（億円）', overlaying='y', side='right', showgrid=False, zeroline=False),
+)
+st.plotly_chart(fig_detail, use_container_width=True)
+
+if not detail.empty:
+    a,b,c = st.columns(3)
+    a.metric('期間内 買い', f"{detail['買い表示'].sum():,.0f} 億円")
+    b.metric('期間内 売り', f"{detail['売り表示'].abs().sum():,.0f} 億円")
+    c.metric('期間内 差引', f"{detail['差引'].sum():+,.0f} 億円")
+
 st.divider()
 
 plot_df = all_df[all_df['投資部門'].isin(selected)].copy()
