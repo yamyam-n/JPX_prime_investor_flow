@@ -5,7 +5,6 @@ from urllib.parse import urljoin
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 import requests
 import streamlit as st
@@ -13,101 +12,157 @@ from bs4 import BeautifulSoup
 
 st.set_page_config(page_title='JPX プライム 投資部門別売買', page_icon='📊', layout='wide', initial_sidebar_state='collapsed')
 
-# iPhone / mobile responsive tuning
-st.markdown("""
+st.markdown('''
 <style>
-.block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1200px;}
-[data-testid="stMetricValue"] {font-size: 1.55rem;}
+.block-container {padding-top: .9rem; padding-bottom: 2rem; max-width: 1180px;}
+[data-testid="stMetricValue"] {font-size: 1.48rem;}
 [data-testid="stPlotlyChart"] {width: 100% !important;}
 @media (max-width: 700px) {
-  .block-container {padding-left: .65rem !important; padding-right: .65rem !important; padding-top: .55rem !important;}
-  h1 {font-size: 1.55rem !important; line-height: 1.25 !important;}
-  h2, h3 {font-size: 1.18rem !important;}
-  [data-testid="stHorizontalBlock"] {flex-wrap: wrap !important; gap: .35rem !important;}
+  .block-container {padding-left: .55rem !important; padding-right: .55rem !important; padding-top: .45rem !important;}
+  h1 {font-size: 1.45rem !important; line-height: 1.22 !important;}
+  h2, h3 {font-size: 1.12rem !important;}
+  [data-testid="stHorizontalBlock"] {flex-wrap: wrap !important; gap: .28rem !important;}
   [data-testid="column"] {min-width: 100% !important; width: 100% !important; flex: 1 1 100% !important;}
-  [data-testid="stMetric"] {padding: .45rem .6rem !important;}
-  [data-testid="stMetricValue"] {font-size: 1.35rem !important;}
-  [data-testid="stDataFrame"] {font-size: .78rem !important;}
+  [data-testid="stMetric"] {padding: .38rem .5rem !important;}
+  [data-testid="stMetricValue"] {font-size: 1.28rem !important;}
   .stPlotlyChart {overflow-x: hidden !important;}
 }
 </style>
-""", unsafe_allow_html=True)
+''', unsafe_allow_html=True)
 
 JPX_WEEKLY = 'https://www.jpx.co.jp/markets/statistics-equities/investor-type/index.html'
-HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; JPXInvestorFlow/1.0)'}
+HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; JPXInvestorFlow/1.3)'}
 MAJOR = ['海外投資家', '個人', '信託銀行', '事業法人', '投資信託', '証券会社']
 ALIASES = {
-    '海外投資家': ['海外投資家', '外国人', '外国法人等'],
-    '個人': ['個人', '個人・その他'],
-    '信託銀行': ['信託銀行'],
-    '事業法人': ['事業法人'],
-    '投資信託': ['投資信託'],
-    '証券会社': ['証券会社'],
-    '生保・損保': ['生保・損保', '生損保'],
-    '都銀・地銀等': ['都銀・地銀等', '都銀・地銀'],
-    'その他金融機関': ['その他金融機関'],
-    'その他法人等': ['その他法人等', 'その他法人'],
-    '自己計': ['自己計', '自己'],
-    '委託計': ['委託計', '委託'],
+    '海外投資家': ['海外投資家', '外国人', '外国法人等', 'Foreigners'],
+    '個人': ['個人', '個人・その他', 'Individuals'],
+    '信託銀行': ['信託銀行', 'TrustBK', 'TrustBank'],
+    '事業法人': ['事業法人', 'BusinessCos'],
+    '投資信託': ['投資信託', 'Investment'],
+    '証券会社': ['証券会社', 'SecuritiesCos'],
+    '生保・損保': ['生保・損保', '生損保', 'Life&Non-Life'],
+    '都銀・地銀等': ['都銀・地銀等', '都銀・地銀', 'City&RegionalBK'],
+    'その他金融機関': ['その他金融機関', 'OtherFinancials'],
+    'その他法人等': ['その他法人等', 'その他法人', 'OtherCos'],
+    '自己計': ['自己計', 'Proprietary'],
+    '委託計': ['委託計', 'Brokerage'],
 }
 
 
 def clean_text(x):
     if pd.isna(x):
         return ''
-    return re.sub(r'\s+', '', str(x)).replace('\u3000', '')
+    s = str(x).replace('\u3000', '').replace('\n', '').replace('\r', '')
+    return re.sub(r'\s+', '', s)
 
 
 def num(x):
-    if pd.isna(x): return np.nan
-    if isinstance(x, (int, float, np.number)): return float(x)
+    if pd.isna(x):
+        return np.nan
+    if isinstance(x, (int, float, np.number)):
+        return float(x)
     s = str(x).replace(',', '').replace('△', '-').replace('▲', '-').strip()
     s = re.sub(r'[^0-9.\-]', '', s)
-    if s in ('', '-', '.', '-.'): return np.nan
-    try: return float(s)
-    except: return np.nan
+    if s in ('', '-', '.', '-.'):
+        return np.nan
+    try:
+        return float(s)
+    except Exception:
+        return np.nan
+
+
+def canonical_label(text):
+    t = clean_text(text)
+    for canon, aliases in ALIASES.items():
+        if any(clean_text(a).lower() in t.lower() for a in aliases):
+            return canon
+    return None
+
+
+def parse_period_text(text):
+    """JPX行見出しから週の開始日・終了日を取り出す。"""
+    t = str(text)
+    # 2026年8月第4週(8月24日～8月28日)
+    ym = re.search(r'(20\d{2})年\s*(\d{1,2})月', t)
+    year = int(ym.group(1)) if ym else None
+    md = re.findall(r'(\d{1,2})月\s*(\d{1,2})日', t)
+    if year and md:
+        dates = [pd.Timestamp(year, int(m), int(d)) for m, d in md]
+        return min(dates), max(dates)
+    # 8/24 - 8/28, year may appear separately
+    slash = re.findall(r'(?<!\d)(\d{1,2})[/-](\d{1,2})(?!\d)', t)
+    if slash and year:
+        dates = [pd.Timestamp(year, int(m), int(d)) for m, d in slash]
+        return min(dates), max(dates)
+    return pd.NaT, pd.NaT
+
+
+def extract_week_rows(html, base_url):
+    """日付のある表行だけを対象に、最後のExcelリンク=金額ファイルを取得。サンプルを混ぜない。"""
+    soup = BeautifulSoup(html, 'html.parser')
+    found = []
+    for tr in soup.find_all('tr'):
+        row_text = tr.get_text(' ', strip=True)
+        start, end = parse_period_text(row_text)
+        if pd.isna(end):
+            continue
+        cells = tr.find_all(['td', 'th'])
+        if len(cells) < 2:
+            continue
+        # JPX表は「日付 | 株数 | 金額」。金額列（最後のセル）内のExcelを優先。
+        candidates = []
+        for a in cells[-1].find_all('a', href=True):
+            href = urljoin(base_url, a['href'])
+            if re.search(r'\.xlsx?(?:\?|$)', href, re.I):
+                candidates.append(href)
+        # レイアウト変更時等の保険として行内も確認
+        if not candidates:
+            for a in tr.find_all('a', href=True):
+                href = urljoin(base_url, a['href'])
+                if re.search(r'\.xlsx?(?:\?|$)', href, re.I) and ('val' in href.lower() or 'stock_1_w_' in href.lower()):
+                    candidates.append(href)
+        if not candidates:
+            continue
+        # 旧形式は val を最優先。新形式は unified workbook。
+        val_links = [u for u in candidates if 'val' in u.lower()]
+        url = val_links[-1] if val_links else candidates[-1]
+        found.append({'text': row_text, 'url': url, 'start': start, 'end': end})
+    return found
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def discover_excel_links():
+def discover_week_files(max_weeks=26):
+    """最新ページ＋バックナンバーをたどり、金額Excelだけを週ごとに取得。"""
     r = requests.get(JPX_WEEKLY, headers=HEADERS, timeout=30)
     r.raise_for_status()
+    records = extract_week_rows(r.text, JPX_WEEKLY)
+
     soup = BeautifulSoup(r.text, 'html.parser')
-    links = []
+    archive_urls = []
     for a in soup.find_all('a', href=True):
         href = urljoin(JPX_WEEKLY, a['href'])
-        text = clean_text(a.get_text(' ', strip=True))
-        if re.search(r'\.xlsx?(?:\?|$)', href, re.I):
-            links.append((text, href))
-    # 金額ファイルを優先。新形式 stock_1_w_*.xlsx も対象。
-    money = [(t,u) for t,u in links if ('val' in u.lower() or 'stock_1_w_' in u.lower())]
-    return money or links
+        if 'investor-type' in href and 'archives' in href and href not in archive_urls:
+            archive_urls.append(href)
 
-
-def dates_from_text(text):
-    """URL/リンク文言から8桁日付を拾う。"""
-    vals = re.findall(r'(?<!\d)(20\d{6})(?!\d)', str(text))
-    out = []
-    for v in vals:
+    # 現行ページに十分な週数がなければアーカイブを順番に読む
+    for archive_url in archive_urls:
+        if len({x['end'] for x in records}) >= max_weeks:
+            break
         try:
-            out.append(pd.to_datetime(v, format='%Y%m%d'))
+            rr = requests.get(archive_url, headers=HEADERS, timeout=30)
+            rr.raise_for_status()
+            records.extend(extract_week_rows(rr.text, archive_url))
         except Exception:
             pass
-    return out
 
-
-def week_label_from_url(url, fallback=''):
-    # ファイル名をそのままX軸に出さず、期間末の日付を短く表示
-    dates = dates_from_text(url) + dates_from_text(fallback)
-    if dates:
-        d = max(dates)
-        return f'{d.month}/{d.day:02d}'
-    # "8/3" や "08/03" のような表記があれば末尾を採用
-    md = re.findall(r'(?<!\d)(\d{1,2})[/-](\d{1,2})(?!\d)', str(fallback))
-    if md:
-        m, d = md[-1]
-        return f'{int(m)}/{int(d):02d}'
-    return ''
+    # URLではなく週末日で重複排除。新しい順。
+    by_end = {}
+    for rec in records:
+        key = rec['end']
+        if pd.notna(key) and key not in by_end:
+            by_end[key] = rec
+    out = sorted(by_end.values(), key=lambda x: x['end'], reverse=True)
+    return out[:max_weeks]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -119,313 +174,306 @@ def read_excel_url(url):
     return pd.read_excel(bio, sheet_name=None, header=None, engine=engine)
 
 
+def sheet_score_for_prime(name, df):
+    score = 0
+    n = clean_text(name).lower()
+    if 'プライム' in n or 'prime' in n:
+        score += 100
+    top = ''.join(clean_text(v) for v in df.iloc[:15, :min(5, df.shape[1])].values.flatten()).lower()
+    if 'プライム' in top or 'prime' in top:
+        score += 80
+    # 新市場移行前の古い「東証1部」はPrimeとは別物なので自動採用しない
+    if 'スタンダード' in top or 'グロース' in top:
+        score -= 50
+    return score
+
+
 def choose_prime_sheet(sheets):
-    # 現行形式: プライム市場の専用シートを探す
-    for name, df in sheets.items():
-        key = clean_text(name)
-        if 'プライム' in key or 'Prime' in str(name):
-            return name, df
-    # シート名で見つからない場合、セル内に「プライム」を含むシート
-    for name, df in sheets.items():
-        txt = ''.join(clean_text(v) for v in df.head(30).astype(object).values.flatten())
-        if 'プライム' in txt:
-            return name, df
-    # fallback: 最大シート
+    scored = [(sheet_score_for_prime(n, d), n, d) for n, d in sheets.items()]
+    scored.sort(key=lambda x: x[0], reverse=True)
+    if scored and scored[0][0] > 0:
+        return scored[0][1], scored[0][2]
+    # 新形式は全市場1シートなので、そのまま最大シートを返す
     name = max(sheets, key=lambda k: sheets[k].shape[0] * sheets[k].shape[1])
     return name, sheets[name]
 
 
-def canonical_label(text):
-    t = clean_text(text)
-    for canon, aliases in ALIASES.items():
-        if any(clean_text(a) in t for a in aliases):
-            return canon
-    return None
+def detect_unit_multiplier(df):
+    """Excel記載の単位を億円への倍率に変換。"""
+    text = ' '.join(clean_text(v) for v in df.iloc[:20, :].values.flatten())
+    if '千円' in text:
+        return 1 / 100000.0, '千円'
+    if '百万円' in text:
+        return 1 / 100.0, '百万円'
+    if '億円' in text:
+        return 1.0, '億円'
+    if re.search(r'(?<!千)(?<!万)円', text):
+        return 1 / 100000000.0, '円'
+    # 現行の金額ファイルは原則千円。明示が読めない場合も千円として扱う。
+    return 1 / 100000.0, '千円(推定)'
+
+
+def old_value_column(df):
+    """旧形式の金額列を特定。既知形式は0:A=部門,1:B=売買,8:I=金額。"""
+    if df.shape[1] >= 9:
+        return 8
+    # 保険: 売り/買い行で数値が最も多い列
+    scores = []
+    for c in range(df.shape[1]):
+        cnt = sum(pd.notna(num(v)) for v in df.iloc[:, c])
+        scores.append((cnt, c))
+    return max(scores)[1]
 
 
 def parse_old_prime(df):
-    """現行（〜2026/9/28）横持ちExcelを、ラベル探索で読み取る。"""
-    arr = df.astype(object).copy()
-    out = []
-    # 投資家ラベルのセルを探し、近傍の「売り」「買い」「差引」または数値列を読む
-    for r in range(arr.shape[0]):
-        for c in range(arr.shape[1]):
-            canon = canonical_label(arr.iat[r,c])
-            if not canon:
-                continue
-            # 右方向最大12列、下方向最大4行を候補にする
-            block = arr.iloc[r:min(r+5, arr.shape[0]), c:min(c+13, arr.shape[1])]
-            vals = []
-            tagged = {}
-            for rr in range(block.shape[0]):
-                rowtxt = [clean_text(x) for x in block.iloc[rr].tolist()]
-                nums = [num(x) for x in block.iloc[rr].tolist()]
-                nnums = [x for x in nums if pd.notna(x)]
-                joined = ''.join(rowtxt)
-                if '売' in joined and nnums: tagged['sell'] = nnums[-1]
-                if '買' in joined and nnums: tagged['buy'] = nnums[-1]
-                if ('差引' in joined or '差引き' in joined) and nnums: tagged['net'] = nnums[-1]
-                vals.extend(nnums)
-            if 'buy' in tagged and 'sell' in tagged:
-                sell, buy = tagged['sell'], tagged['buy']
-                net = tagged.get('net', buy-sell)
-                out.append((canon, sell, buy, net)); continue
-            # 1行形式: ラベル右側の数値から売・買・差引を推定
-            rownums = [num(x) for x in arr.iloc[r, c+1:min(c+15, arr.shape[1])].tolist()]
-            rownums = [x for x in rownums if pd.notna(x)]
-            if len(rownums) >= 3:
-                # 売・買・差引の並びであることが多い。最後3つを利用。
-                sell, buy, netv = rownums[-3:]
-                if abs((buy-sell)-netv) <= max(10, abs(netv)*0.05):
-                    out.append((canon, sell, buy, netv))
-    if not out:
-        return pd.DataFrame(columns=['投資部門','売り','買い','差引'])
-    res = pd.DataFrame(out, columns=['投資部門','売り','買い','差引'])
-    # 同じ部門が複数ヒットした場合、売買額が最大の行を採用
-    res['scale'] = res['売り'].abs() + res['買い'].abs()
-    res = res.sort_values('scale').drop_duplicates('投資部門', keep='last').drop(columns='scale')
-    return res
+    """2026/9/28までの市場別シートを読む。JPX既知形式(A=部門,B=売買,I=金額)を優先。"""
+    if df.empty:
+        return pd.DataFrame(columns=['投資部門', '売り', '買い', '差引'])
+    c_value = old_value_column(df)
+    current = None
+    values = {}
+    for r in range(df.shape[0]):
+        first = clean_text(df.iat[r, 0]) if df.shape[1] > 0 else ''
+        canon = canonical_label(first)
+        if canon:
+            current = canon
+        side = clean_text(df.iat[r, 1]) if df.shape[1] > 1 else ''
+        if current and ('売り' in side or side.lower() == 'sell'):
+            v = num(df.iat[r, c_value])
+            if pd.notna(v):
+                values.setdefault(current, {})['売り'] = v
+        elif current and ('買い' in side or side.lower() == 'buy'):
+            v = num(df.iat[r, c_value])
+            if pd.notna(v):
+                values.setdefault(current, {})['買い'] = v
+
+    rows = []
+    for investor, x in values.items():
+        if '売り' in x and '買い' in x:
+            rows.append([investor, x['売り'], x['買い'], x['買い'] - x['売り']])
+    return pd.DataFrame(rows, columns=['投資部門', '売り', '買い', '差引'])
+
+
+def find_prime_rows_new(df):
+    rows = []
+    for r in range(df.shape[0]):
+        txt = ''.join(clean_text(x) for x in df.iloc[r, :min(df.shape[1], 8)].tolist())
+        if 'プライム' in txt or 'Prime' in txt:
+            rows.append(r)
+    return rows
 
 
 def parse_new_format(df):
-    """2026/9/29以降の1シート集約形式を汎用的に読む。"""
-    # プライムを含む行を中心に、列ヘッダを上方向から復元する
-    prime_rows = []
-    for r in range(df.shape[0]):
-        joined = ''.join(clean_text(x) for x in df.iloc[r].tolist())
-        if 'プライム' in joined:
-            prime_rows.append(r)
+    """2026/9/29以降の1シート集約形式。市場行=Prime、列見出し=投資部門/売買を復元。"""
+    prime_rows = find_prime_rows_new(df)
+    if not prime_rows:
+        return pd.DataFrame(columns=['投資部門', '売り', '買い', '差引'])
+
+    # 各列の上側見出しを連結し、どの投資部門・売買区分かを決める
+    header_rows = max(0, min(prime_rows) - 8)
     records = []
     for r in prime_rows:
         for c in range(df.shape[1]):
-            v = num(df.iat[r,c])
-            if pd.isna(v): continue
-            header = ''.join(clean_text(df.iat[rr,c]) for rr in range(max(0,r-5), r))
+            v = num(df.iat[r, c])
+            if pd.isna(v):
+                continue
+            header = ''.join(clean_text(df.iat[rr, c]) for rr in range(header_rows, r))
             canon = canonical_label(header)
-            if not canon: continue
-            # ヘッダに差引があれば直接採用。売/買は別辞書にためる
-            metric = 'net' if '差引' in header else ('buy' if '買' in header else ('sell' if '売' in header else None))
+            if not canon:
+                continue
+            h = header.lower()
+            metric = None
+            if '売り' in h or 'sell' in h:
+                metric = '売り'
+            elif '買い' in h or 'buy' in h:
+                metric = '買い'
+            elif '差引' in h or 'balance' in h or 'net' in h:
+                metric = '差引'
             if metric:
                 records.append((canon, metric, v))
+
     if not records:
-        return pd.DataFrame(columns=['投資部門','売り','買い','差引'])
-    d = pd.DataFrame(records, columns=['投資部門','metric','value']).pivot_table(index='投資部門', columns='metric', values='value', aggfunc='last').reset_index()
-    d = d.rename(columns={'sell':'売り','buy':'買い','net':'差引'})
-    for col in ['売り','買い','差引']:
-        if col not in d: d[col] = np.nan
-    d['差引'] = d['差引'].fillna(d['買い']-d['売り'])
-    return d[['投資部門','売り','買い','差引']]
+        return pd.DataFrame(columns=['投資部門', '売り', '買い', '差引'])
+    p = pd.DataFrame(records, columns=['投資部門', 'metric', 'value'])
+    p = p.pivot_table(index='投資部門', columns='metric', values='value', aggfunc='last').reset_index()
+    for col in ['売り', '買い', '差引']:
+        if col not in p:
+            p[col] = np.nan
+    p['差引'] = p['差引'].fillna(p['買い'] - p['売り'])
+    return p[['投資部門', '売り', '買い', '差引']]
+
+
+def validate_parsed(d):
+    """誤列取得を弾く。売り買いが同桁で、差引=買い-売りであることを確認。"""
+    if d.empty:
+        return False, '投資部門を抽出できませんでした'
+    check = d.dropna(subset=['売り', '買い']).copy()
+    if check.empty:
+        return False, '売り・買いを抽出できませんでした'
+    if (check[['売り', '買い']] < 0).any().any():
+        return False, '売買金額に負値が含まれています'
+    # 売りと買いは通常同程度。明らかな片側ゼロ/誤列を排除。
+    ratio = (check[['売り', '買い']].max(axis=1) / check[['売り', '買い']].min(axis=1).replace(0, np.nan))
+    if ratio.dropna().gt(20).mean() > 0.25:
+        return False, '売りと買いの桁が一致せず、列判定に失敗した可能性があります'
+    calc = check['買い'] - check['売り']
+    err = (calc - check['差引']).abs().fillna(0)
+    if (err > np.maximum(1, calc.abs() * .001)).any():
+        return False, '差引の検算に失敗しました'
+    return True, ''
 
 
 def parse_file(url):
     sheets = read_excel_url(url)
     name, df = choose_prime_sheet(sheets)
-    parsed = parse_new_format(df) if ('stock_1_w_' in url.lower() or len(sheets)==1) else parse_old_prime(df)
-    return name, parsed
-
-
-def to_oku(x):
-    # JPX金額Excelの基本単位は千円であるケースを想定。桁から自動判定。
-    # 1億円 = 100,000千円。既に億円級ならそのまま。
-    if pd.isna(x): return np.nan
-    ax = abs(x)
-    return x / 100000.0 if ax > 1000000 else x
+    # unified fileはファイル名で判定、それ以外は旧形式
+    is_new = 'stock_1_w_' in url.lower()
+    parsed = parse_new_format(df) if is_new else parse_old_prime(df)
+    ok, msg = validate_parsed(parsed)
+    if not ok:
+        raise ValueError(f'{name}: {msg}')
+    multiplier, unit = detect_unit_multiplier(df)
+    parsed = parsed.copy()
+    for col in ['売り', '買い', '差引']:
+        parsed[col] = parsed[col] * multiplier
+    return name, unit, parsed
 
 
 st.title('📊 JPX 投資部門別売買状況 — 東証プライム')
-st.caption('週次・金額ベース / 差引 = 買い − 売り / JPX公表資料から取得 / iPhone対応 v1.2')
+st.caption('週次・金額ベース / 売りはマイナス表示 / 差引 = 買い − 売り / iPhone対応 v1.3')
 
 with st.sidebar:
     st.header('表示設定')
     weeks = st.slider('取得する直近週数', 4, 26, 12)
-    selected = st.multiselect('表示する投資部門', MAJOR, default=['海外投資家','個人','信託銀行','事業法人','投資信託'])
-    st.caption('JPXの週間公表は通常、第4営業日15:30。')
+    st.caption('JPX週間データの金額Excelのみを読み込みます。')
 
 try:
-    links = discover_excel_links()
+    files = discover_week_files(weeks)
 except Exception as e:
     st.error(f'JPXページの取得に失敗しました: {e}')
     st.stop()
 
-# 同じURLを除去し、ページ掲載順の新しいものから使う
-seen = set(); unique=[]
-for text,url in links:
-    if url not in seen:
-        seen.add(url); unique.append((text,url))
-links = unique[:weeks]
+if not files:
+    st.error('JPXの週次・金額Excelを見つけられませんでした。')
+    st.stop()
 
-rows=[]; errors=[]
+rows, errors = [], []
 progress = st.progress(0, text='JPXデータを取得中…')
-for i,(text,url) in enumerate(links):
+for i, rec in enumerate(files):
     try:
-        sheet, d = parse_file(url)
-        label = week_label_from_url(url, text) or f'週{i+1}'
-        for _,r in d.iterrows():
-            rows.append({'週':label,'投資部門':r['投資部門'],'売り':to_oku(r['売り']),'買い':to_oku(r['買い']),'差引':to_oku(r['差引']),'source':url})
+        sheet, unit, d = parse_file(rec['url'])
+        for _, r in d.iterrows():
+            rows.append({
+                '週開始': rec['start'], '週終了': rec['end'],
+                '投資部門': r['投資部門'], '売り': r['売り'], '買い': r['買い'], '差引': r['差引'],
+                'source': rec['url'], 'sheet': sheet, 'source_unit': unit,
+            })
     except Exception as e:
-        errors.append((url,str(e)))
-    progress.progress((i+1)/max(1,len(links)), text=f'JPXデータを取得中… {i+1}/{len(links)}')
+        errors.append((rec['text'], rec['url'], str(e)))
+    progress.progress((i + 1) / max(1, len(files)), text=f'JPXデータを取得中… {i + 1}/{len(files)}')
 progress.empty()
 
 all_df = pd.DataFrame(rows)
 if all_df.empty:
-    st.error('データを解析できませんでした。JPXのExcelレイアウト変更の可能性があります。')
-    if errors: st.code('\n'.join(f'{u} :: {e}' for u,e in errors[:5]))
+    st.error('プライム市場のデータを解析できませんでした。下の「データ取得状況」を確認してください。')
+    if errors:
+        with st.expander('データ取得状況 / エラー', expanded=True):
+            st.code('\n\n'.join(f'{t}\n{u}\n{e}' for t, u, e in errors[:10]))
     st.stop()
 
-# ページ順を保持
-week_order=[]
-for t,u in links:
-    candidates = all_df.loc[all_df.source.eq(u),'週'].unique().tolist()
-    week_order += [x for x in candidates if x not in week_order]
-week_order = list(reversed(week_order))
-all_df['週'] = pd.Categorical(all_df['週'], categories=week_order, ordered=True)
-all_df = all_df.sort_values(['週','投資部門'])
+all_df = all_df.sort_values(['週終了', '投資部門']).drop_duplicates(['週終了', '投資部門'], keep='last')
+latest_end = all_df['週終了'].max()
+latest = all_df[all_df['週終了'].eq(latest_end)].copy()
 
-latest_week = week_order[-1]
-latest = all_df[all_df['週']==latest_week].copy().sort_values('差引', ascending=False)
+# 週の解析件数を見える化（誤データに気づきやすくする）
+parsed_weeks = all_df['週終了'].nunique()
+st.caption(f'正常解析: {parsed_weeks}週 / 取得候補: {len(files)}週' + (f' / エラー: {len(errors)}週' if errors else ''))
 
-# KPI
-st.subheader(f'直近週：{latest_week}')
-kpis=[]
-for name in ['海外投資家','個人','信託銀行','事業法人']:
-    s=latest.loc[latest['投資部門'].eq(name),'差引']
-    val=s.iloc[0] if len(s) else np.nan
-    kpis.append((name,val))
-cols=st.columns(4)
-for c,(name,val) in zip(cols,kpis):
-    if pd.isna(val): c.metric(name,'—')
-    else: c.metric(name,f'{val:+,.0f} 億円')
+st.subheader(f"直近週：{latest_end.month}/{latest_end.day:02d} 終了")
+cols = st.columns(4)
+for c, name in zip(cols, ['海外投資家', '個人', '信託銀行', '事業法人']):
+    s = latest.loc[latest['投資部門'].eq(name), '差引']
+    if s.empty:
+        c.metric(name, '—')
+    else:
+        v = float(s.iloc[0])
+        c.metric(name, f'{v:+,.0f} 億円', '買い越し' if v > 0 else ('売り越し' if v < 0 else '均衡'))
 
-
-# --- 投資家別 売買グラフ -------------------------------------------------
 st.divider()
 st.subheader('投資家別 売買推移')
-st.caption('売りはマイナス、買いはプラス、差引は折れ線で表示します。')
+st.caption('買い＝プラスの棒、売り＝マイナスの棒、差引＝折れ線。月次は週次公表値を月ごとに合計します。')
 
-available_investors = [x for x in ALIASES.keys() if x in all_df['投資部門'].astype(str).unique().tolist()]
-if not available_investors:
-    available_investors = sorted(all_df['投資部門'].astype(str).unique().tolist())
+available = [x for x in MAJOR + ['生保・損保', '都銀・地銀等', 'その他金融機関', 'その他法人等', '自己計', '委託計'] if x in all_df['投資部門'].unique()]
+if not available:
+    available = sorted(all_df['投資部門'].unique())
 
-g1, g2 = st.columns([2, 1])
-with g1:
-    investor_pick = st.selectbox(
-        '投資家を選択',
-        available_investors,
-        index=available_investors.index('海外投資家') if '海外投資家' in available_investors else 0,
-        key='investor_detail_pick',
-    )
-with g2:
-    period_pick = st.radio('集計単位', ['週次', '月次'], horizontal=True, key='period_detail_pick')
+c1, c2 = st.columns([2, 1])
+with c1:
+    investor = st.selectbox('投資家を選択', available, index=available.index('海外投資家') if '海外投資家' in available else 0)
+with c2:
+    period = st.radio('集計単位', ['週次', '月次'], horizontal=True)
 
-one = all_df[all_df['投資部門'].astype(str).eq(investor_pick)].copy()
+one = all_df[all_df['投資部門'].eq(investor)].copy().sort_values('週終了')
 one['売り表示'] = -one['売り'].abs()
 one['買い表示'] = one['買い'].abs()
 
-# JPXリンクのURLやラベルから週の終了日をできるだけ復元する
-url_to_order = {u:i for i,(_,u) in enumerate(reversed(links))}
-one['_order'] = one['source'].map(url_to_order).fillna(0)
-
-def extract_date(row):
-    # URLまたは表示ラベルから週末日を復元
-    dates = dates_from_text(str(row.get('source','')))
-    if dates:
-        return max(dates)
-    label = str(row.get('週',''))
-    m = re.search(r'(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)', label)
-    if m:
-        # 年が取れない場合は現在年を使用（表示順は_source順で補助）
-        return pd.Timestamp(datetime.now().year, int(m.group(1)), int(m.group(2)))
-    return pd.NaT
-
-one['_date'] = one.apply(extract_date, axis=1)
-one = one.sort_values(['_date','_order'], na_position='last')
-
-if period_pick == '月次':
-    valid = one.dropna(subset=['_date']).copy()
-    if not valid.empty:
-        valid['月'] = valid['_date'].dt.to_period('M').astype(str)
-        detail = valid.groupby('月', as_index=False)[['売り表示','買い表示','差引']].sum()
-        detail = detail.rename(columns={'月':'期間'})
-    else:
-        # 日付が取れない場合は4週単位の簡易集計
-        tmp = one.reset_index(drop=True).copy()
-        tmp['_mgrp'] = np.arange(len(tmp)) // 4
-        detail = tmp.groupby('_mgrp', as_index=False)[['売り表示','買い表示','差引']].sum()
-        detail['期間'] = detail['_mgrp'].map(lambda x: f'4週集計 {x+1}')
+if period == '月次':
+    one['月'] = one['週終了'].dt.to_period('M')
+    detail = one.groupby('月', as_index=False)[['売り表示', '買い表示', '差引']].sum()
+    detail['期間'] = detail['月'].map(lambda p: f'{p.year}/{p.month:02d}')
 else:
-    detail = one[['週','売り表示','買い表示','差引','_date']].copy().rename(columns={'週':'期間'})
-    # iPhoneで読める短い週ラベル
-    detail['期間'] = detail.apply(lambda r: f"{r['_date'].month}/{r['_date'].day:02d}" if pd.notna(r['_date']) else str(r['期間']), axis=1)
-    detail = detail.drop(columns=['_date'])
+    detail = one[['週終了', '売り表示', '買い表示', '差引']].copy()
+    detail['期間'] = detail['週終了'].map(lambda d: f'{d.month}/{d.day:02d}')
 
-# 添付イメージに近い、上下バー＋差引線
-fig_detail = go.Figure()
-fig_detail.add_trace(go.Bar(
-    x=detail['期間'], y=detail['売り表示'], name='Sales',
-    hovertemplate='%{x}<br>売り: %{customdata:,.0f} 億円<extra></extra>',
-    customdata=detail['売り表示'].abs(),
+fig = go.Figure()
+fig.add_trace(go.Bar(
+    x=detail['期間'], y=detail['売り表示'], name='売り',
+    hovertemplate='%{x}<br>売り %{customdata:,.0f} 億円<extra></extra>', customdata=detail['売り表示'].abs(),
 ))
-fig_detail.add_trace(go.Bar(
-    x=detail['期間'], y=detail['買い表示'], name='Purchases',
-    hovertemplate='%{x}<br>買い: %{y:,.0f} 億円<extra></extra>',
+fig.add_trace(go.Bar(
+    x=detail['期間'], y=detail['買い表示'], name='買い',
+    hovertemplate='%{x}<br>買い %{y:,.0f} 億円<extra></extra>',
 ))
-fig_detail.add_trace(go.Scatter(
-    x=detail['期間'], y=detail['差引'], name='Balance', mode='lines+markers',
-    yaxis='y2', hovertemplate='%{x}<br>差引: %{y:+,.0f} 億円<extra></extra>',
+fig.add_trace(go.Scatter(
+    x=detail['期間'], y=detail['差引'], name='差引', mode='lines+markers', yaxis='y2',
+    hovertemplate='%{x}<br>差引 %{y:+,.0f} 億円<extra></extra>',
 ))
-fig_detail.update_layout(
-    title=f'{investor_pick} — {period_pick}',
-    barmode='relative',
-    height=430,
-    margin=dict(l=6,r=6,t=52,b=72),
-    legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='center', x=0.5),
+fig.update_layout(
+    title=f'{investor} — {period}', barmode='relative', height=420,
+    margin=dict(l=8, r=8, t=48, b=56),
+    legend=dict(orientation='h', yanchor='top', y=-0.12, xanchor='center', x=.5),
     xaxis=dict(title='', tickangle=0, automargin=True, nticks=min(8, max(2, len(detail)))),
-    yaxis=dict(title='売買金額（億円）', zeroline=True, zerolinewidth=1),
-    yaxis2=dict(title='差引（億円）', overlaying='y', side='right', showgrid=False, zeroline=False),
+    yaxis=dict(title='売買金額（億円）', zeroline=True, zerolinewidth=1, tickformat=',~s'),
+    yaxis2=dict(title='差引（億円）', overlaying='y', side='right', showgrid=False, zeroline=True, tickformat=',~s'),
+    hovermode='x unified',
 )
-st.plotly_chart(fig_detail, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
-
-if not detail.empty:
-    a,b,c = st.columns(3)
-    a.metric('期間内 買い', f"{detail['買い表示'].sum():,.0f} 億円")
-    b.metric('期間内 売り', f"{detail['売り表示'].abs().sum():,.0f} 億円")
-    c.metric('期間内 差引', f"{detail['差引'].sum():+,.0f} 億円")
-
-st.divider()
-
-plot_df = all_df[all_df['投資部門'].isin(selected)].copy()
-fig = px.bar(plot_df, x='週', y='差引', color='投資部門', barmode='group',
-             labels={'差引':'買い越し / 売り越し（億円）'},
-             title='投資部門別 ネット売買（週次）')
-fig.add_hline(y=0, line_width=1)
-fig.update_layout(height=400, legend_title_text='', margin=dict(l=6,r=6,t=50,b=55), legend=dict(orientation='h', y=-0.18), xaxis=dict(tickangle=0, nticks=8, automargin=True))
 st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
 
-cum = plot_df.copy()
-cum['累積'] = cum.groupby('投資部門', observed=True)['差引'].cumsum()
-fig2 = px.line(cum, x='週', y='累積', color='投資部門', markers=True,
-               labels={'累積':'累積ネット売買（億円）'}, title='期間累積の買い越し・売り越し')
-fig2.add_hline(y=0, line_width=1)
-fig2.update_layout(height=390, legend_title_text='', margin=dict(l=6,r=6,t=50,b=55), legend=dict(orientation='h', y=-0.18), xaxis=dict(tickangle=0, nticks=8, automargin=True))
-st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
+if not detail.empty:
+    m1, m2, m3 = st.columns(3)
+    m1.metric('期間内 買い', f"{detail['買い表示'].sum():,.0f} 億円")
+    m2.metric('期間内 売り', f"{detail['売り表示'].abs().sum():,.0f} 億円")
+    m3.metric('期間内 差引', f"{detail['差引'].sum():+,.0f} 億円")
 
-c1,c2=st.columns([1,1])
-with c1:
-    st.subheader('直近週ランキング')
-    show=latest[['投資部門','差引']].dropna().copy()
-    show['差引（億円）']=show['差引'].map(lambda x:f'{x:+,.0f}')
-    st.dataframe(show[['投資部門','差引（億円）']], hide_index=True, use_container_width=True)
-with c2:
-    st.subheader('売り・買い・差引')
-    tbl=latest[['投資部門','売り','買い','差引']].copy()
-    for col in ['売り','買い','差引']:
-        tbl[col]=tbl[col].map(lambda x:'' if pd.isna(x) else f'{x:,.0f}')
+st.divider()
+st.subheader('直近週の投資部門別差引')
+rank = latest[['投資部門', '差引']].dropna().sort_values('差引', ascending=False)
+fig2 = go.Figure(go.Bar(
+    y=rank['投資部門'], x=rank['差引'], orientation='h',
+    hovertemplate='%{y}<br>%{x:+,.0f} 億円<extra></extra>',
+))
+fig2.update_layout(height=max(350, 31 * len(rank)), margin=dict(l=8, r=8, t=20, b=35), xaxis_title='買い越し / 売り越し（億円）', yaxis_title='')
+st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False, 'responsive': True})
+
+with st.expander('直近週の数値表'):
+    tbl = latest[['投資部門', '売り', '買い', '差引']].copy().sort_values('差引', ascending=False)
+    for col in ['売り', '買い', '差引']:
+        tbl[col] = tbl[col].map(lambda x: f'{x:,.0f}')
     st.dataframe(tbl, hide_index=True, use_container_width=True)
 
 with st.expander('データ取得状況 / エラー'):
-    st.write(f'取得候補: {len(links)}週 / 解析エラー: {len(errors)}件')
+    st.write(f'取得候補: {len(files)}週 / 正常解析: {parsed_weeks}週 / エラー: {len(errors)}週')
     if errors:
-        st.code('\n'.join(f'{u}\n  {e}' for u,e in errors))
+        st.code('\n\n'.join(f'{t}\n{u}\n  {e}' for t, u, e in errors[:12]))
 
-st.caption('出典: 日本取引所グループ（JPX）「投資部門別売買状況」株式・週間。非公式アプリです。')
+st.caption('出典: 日本取引所グループ（JPX）「投資部門別売買状況」株式・週間。対象は東証プライム。非公式アプリです。')
