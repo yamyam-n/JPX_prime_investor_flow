@@ -1,22 +1,15 @@
-# JPX Prime Investor Flow
+# JPX Prime Investor Flow v1.2
 
-JPX「投資部門別売買状況（株式・週間）」から東証プライムの金額データを取得し、投資主体別のネット売買を可視化するStreamlitアプリです。
+東証プライムの「投資部門別売買状況」を可視化する Streamlit アプリです。
 
-## 主な表示
-- 海外投資家 / 個人 / 信託銀行 / 事業法人の直近ネット売買
-- 投資部門別ネット売買の週次棒グラフ
-- 期間累積ネット売買
-- 直近週ランキング
-- 売り・買い・差引表
+## v1.2
+- iPhone / スマートフォン向けレスポンシブ表示
+- スマホでは設定・KPI・表を縦1列に配置
+- Plotlyツールバーを非表示にして表示領域を確保
+- 週次X軸を `8/03` のような短い日付に変更
+- 長いExcelファイル名がX軸に出るケースを抑制
+- 週次 / 月次切替
+- 投資家別に「売り=マイナス」「買い=プラス」「差引=折れ線」を表示
 
-## 起動
-```bash
-pip install -r requirements.txt
-streamlit run streamlit_app.py
-```
-
-## Streamlit Community Cloud
-GitHubリポジトリ直下に `streamlit_app.py` と `requirements.txt` を置き、Main file path に `streamlit_app.py` を指定してください。
-
-## JPXフォーマット変更への対応
-2026-09-29掲載分から週間Excelが1ファイル・1シート集約形式へ変更予定です。このv1は現行形式と新形式の双方をラベル探索で読む設計にしています。ただし実際の新ファイル公開後、列配置に応じた微調整が必要になる可能性があります。
+## Deploy
+GitHub リポジトリへファイル一式を置き、Streamlit Community Cloud で `streamlit_app.py` を指定してください。

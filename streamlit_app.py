@@ -11,7 +11,27 @@ import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 
-st.set_page_config(page_title='JPX プライム 投資部門別売買', page_icon='📊', layout='wide')
+st.set_page_config(page_title='JPX プライム 投資部門別売買', page_icon='📊', layout='wide', initial_sidebar_state='collapsed')
+
+# iPhone / mobile responsive tuning
+st.markdown("""
+<style>
+.block-container {padding-top: 1.0rem; padding-bottom: 2rem; max-width: 1200px;}
+[data-testid="stMetricValue"] {font-size: 1.55rem;}
+[data-testid="stPlotlyChart"] {width: 100% !important;}
+@media (max-width: 700px) {
+  .block-container {padding-left: .65rem !important; padding-right: .65rem !important; padding-top: .55rem !important;}
+  h1 {font-size: 1.55rem !important; line-height: 1.25 !important;}
+  h2, h3 {font-size: 1.18rem !important;}
+  [data-testid="stHorizontalBlock"] {flex-wrap: wrap !important; gap: .35rem !important;}
+  [data-testid="column"] {min-width: 100% !important; width: 100% !important; flex: 1 1 100% !important;}
+  [data-testid="stMetric"] {padding: .45rem .6rem !important;}
+  [data-testid="stMetricValue"] {font-size: 1.35rem !important;}
+  [data-testid="stDataFrame"] {font-size: .78rem !important;}
+  .stPlotlyChart {overflow-x: hidden !important;}
+}
+</style>
+""", unsafe_allow_html=True)
 
 JPX_WEEKLY = 'https://www.jpx.co.jp/markets/statistics-equities/investor-type/index.html'
 HEADERS = {'User-Agent': 'Mozilla/5.0 (compatible; JPXInvestorFlow/1.0)'}
@@ -64,14 +84,30 @@ def discover_excel_links():
     return money or links
 
 
+def dates_from_text(text):
+    """URL/リンク文言から8桁日付を拾う。"""
+    vals = re.findall(r'(?<!\d)(20\d{6})(?!\d)', str(text))
+    out = []
+    for v in vals:
+        try:
+            out.append(pd.to_datetime(v, format='%Y%m%d'))
+        except Exception:
+            pass
+    return out
+
+
 def week_label_from_url(url, fallback=''):
-    m = re.search(r'(20\d{2})(\d{2})(\d{2})[_-](20\d{2})(\d{2})(\d{2})', url)
-    if m:
-        return f'{m.group(2)}/{m.group(3)}〜{m.group(5)}/{m.group(6)}'
-    m = re.search(r'_(\d{2})(\d{2})(\d{2})\.xls', url, re.I)
-    if m:
-        return f'公表 {m.group(1)}/{m.group(2)}/{m.group(3)}'
-    return fallback or url.split('/')[-1]
+    # ファイル名をそのままX軸に出さず、期間末の日付を短く表示
+    dates = dates_from_text(url) + dates_from_text(fallback)
+    if dates:
+        d = max(dates)
+        return f'{d.month}/{d.day:02d}'
+    # "8/3" や "08/03" のような表記があれば末尾を採用
+    md = re.findall(r'(?<!\d)(\d{1,2})[/-](\d{1,2})(?!\d)', str(fallback))
+    if md:
+        m, d = md[-1]
+        return f'{int(m)}/{int(d):02d}'
+    return ''
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -197,7 +233,7 @@ def to_oku(x):
 
 
 st.title('📊 JPX 投資部門別売買状況 — 東証プライム')
-st.caption('週次・金額ベース / 差引 = 買い − 売り / JPX公表資料から取得')
+st.caption('週次・金額ベース / 差引 = 買い − 売り / JPX公表資料から取得 / iPhone対応 v1.2')
 
 with st.sidebar:
     st.header('表示設定')
@@ -223,7 +259,7 @@ progress = st.progress(0, text='JPXデータを取得中…')
 for i,(text,url) in enumerate(links):
     try:
         sheet, d = parse_file(url)
-        label = text if ('週' in text or '〜' in text) else week_label_from_url(url, text)
+        label = week_label_from_url(url, text) or f'週{i+1}'
         for _,r in d.iterrows():
             rows.append({'週':label,'投資部門':r['投資部門'],'売り':to_oku(r['売り']),'買い':to_oku(r['買い']),'差引':to_oku(r['差引']),'source':url})
     except Exception as e:
@@ -291,18 +327,15 @@ url_to_order = {u:i for i,(_,u) in enumerate(reversed(links))}
 one['_order'] = one['source'].map(url_to_order).fillna(0)
 
 def extract_date(row):
-    u = str(row.get('source',''))
-    # URL内の YYYYMMDD_YYYYMMDD を優先し終了日を採用
-    m = re.search(r'(20\\d{2})(\\d{2})(\\d{2})[_-](20\\d{2})(\\d{2})(\\d{2})', u)
-    if m:
-        return pd.Timestamp(int(m.group(4)), int(m.group(5)), int(m.group(6)))
-    # 表示ラベルから MM/DD〜MM/DD。年はURL中の年を補完
+    # URLまたは表示ラベルから週末日を復元
+    dates = dates_from_text(str(row.get('source','')))
+    if dates:
+        return max(dates)
     label = str(row.get('週',''))
-    m2 = re.search(r'(\\d{1,2})/(\\d{1,2}).*?(\\d{1,2})/(\\d{1,2})', label)
-    ym = re.search(r'(20\\d{2})', u)
-    if m2 and ym:
-        y = int(ym.group(1))
-        return pd.Timestamp(y, int(m2.group(3)), int(m2.group(4)))
+    m = re.search(r'(?<!\d)(\d{1,2})/(\d{1,2})(?!\d)', label)
+    if m:
+        # 年が取れない場合は現在年を使用（表示順は_source順で補助）
+        return pd.Timestamp(datetime.now().year, int(m.group(1)), int(m.group(2)))
     return pd.NaT
 
 one['_date'] = one.apply(extract_date, axis=1)
@@ -321,7 +354,10 @@ if period_pick == '月次':
         detail = tmp.groupby('_mgrp', as_index=False)[['売り表示','買い表示','差引']].sum()
         detail['期間'] = detail['_mgrp'].map(lambda x: f'4週集計 {x+1}')
 else:
-    detail = one[['週','売り表示','買い表示','差引']].copy().rename(columns={'週':'期間'})
+    detail = one[['週','売り表示','買い表示','差引','_date']].copy().rename(columns={'週':'期間'})
+    # iPhoneで読める短い週ラベル
+    detail['期間'] = detail.apply(lambda r: f"{r['_date'].month}/{r['_date'].day:02d}" if pd.notna(r['_date']) else str(r['期間']), axis=1)
+    detail = detail.drop(columns=['_date'])
 
 # 添付イメージに近い、上下バー＋差引線
 fig_detail = go.Figure()
@@ -341,14 +377,14 @@ fig_detail.add_trace(go.Scatter(
 fig_detail.update_layout(
     title=f'{investor_pick} — {period_pick}',
     barmode='relative',
-    height=520,
-    margin=dict(l=10,r=10,t=55,b=10),
-    legend=dict(orientation='h', yanchor='bottom', y=-0.22, xanchor='center', x=0.5),
-    xaxis=dict(title=''),
+    height=430,
+    margin=dict(l=6,r=6,t=52,b=72),
+    legend=dict(orientation='h', yanchor='top', y=-0.16, xanchor='center', x=0.5),
+    xaxis=dict(title='', tickangle=0, automargin=True, nticks=min(8, max(2, len(detail)))),
     yaxis=dict(title='売買金額（億円）', zeroline=True, zerolinewidth=1),
     yaxis2=dict(title='差引（億円）', overlaying='y', side='right', showgrid=False, zeroline=False),
 )
-st.plotly_chart(fig_detail, use_container_width=True)
+st.plotly_chart(fig_detail, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
 
 if not detail.empty:
     a,b,c = st.columns(3)
@@ -363,16 +399,16 @@ fig = px.bar(plot_df, x='週', y='差引', color='投資部門', barmode='group'
              labels={'差引':'買い越し / 売り越し（億円）'},
              title='投資部門別 ネット売買（週次）')
 fig.add_hline(y=0, line_width=1)
-fig.update_layout(height=480, legend_title_text='', margin=dict(l=10,r=10,t=50,b=10))
-st.plotly_chart(fig, use_container_width=True)
+fig.update_layout(height=400, legend_title_text='', margin=dict(l=6,r=6,t=50,b=55), legend=dict(orientation='h', y=-0.18), xaxis=dict(tickangle=0, nticks=8, automargin=True))
+st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
 
 cum = plot_df.copy()
 cum['累積'] = cum.groupby('投資部門', observed=True)['差引'].cumsum()
 fig2 = px.line(cum, x='週', y='累積', color='投資部門', markers=True,
                labels={'累積':'累積ネット売買（億円）'}, title='期間累積の買い越し・売り越し')
 fig2.add_hline(y=0, line_width=1)
-fig2.update_layout(height=430, legend_title_text='', margin=dict(l=10,r=10,t=50,b=10))
-st.plotly_chart(fig2, use_container_width=True)
+fig2.update_layout(height=390, legend_title_text='', margin=dict(l=6,r=6,t=50,b=55), legend=dict(orientation='h', y=-0.18), xaxis=dict(tickangle=0, nticks=8, automargin=True))
+st.plotly_chart(fig2, use_container_width=True, config={'displayModeBar': False, 'responsive': True, 'scrollZoom': False})
 
 c1,c2=st.columns([1,1])
 with c1:
